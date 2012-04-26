@@ -18,6 +18,8 @@
 #include <pcap.h>
 #include <mysql++.h>
 
+#include <string>
+
 #include "rtp.h"
 
 #define MAX_IP_PER_CALL 30	//!< total maxumum of SDP sessions for one call-id
@@ -26,7 +28,7 @@
 #define MAX_FNAME 256		//!< max len of stored call-id
 #define MAX_RTPMAP 30          //!< max rtpmap records
 #define RTPTIMEOUT 300
-#define MAXNODE 50000
+#define MAXNODE 150000
 
 #define INVITE 1
 #define BYE 2
@@ -59,6 +61,7 @@ public:
 	char called[256];		//!< To: xxx
 	char byecseq[32];		//!< To: xxx
 	char invitecseq[32];		//!< To: xxx
+	char custom_header1[33];	//!< Custom SIP header
 	bool seeninvite;		//!< true if we see SIP INVITE within the Call
 	bool seeninviteok;			//!< true if we see SIP INVITE within the Call
 	bool seenbye;			//!< true if we see SIP BYE within the Call
@@ -101,6 +104,8 @@ public:
 	unsigned int flags;		//!< structure holding FLAGS*
 
 	int *listening_worker_run;
+
+	int thread_num;
 	
 	/**
 	 * constructor
@@ -227,19 +232,31 @@ public:
 	 * @brief build query 
 	 *
 	*/
-	int buildQuery(mysqlpp::Query *query);
+	int buildQuery(stringstream *query);
 
 	/**
-	 * @brief save call to mysql
+	 * @brief prepare for escape string - connect if need
 	 *
 	*/
-	int saveToMysql();
+	bool prepareForEscapeString();
 
 	/**
-	 * @brief save register msgs to mysql
+	 * @brief execute query 
 	 *
 	*/
-	int saveRegisterToMysql();
+	int doQuery(string &queryStr);
+	
+	/**
+	 * @brief save call to database
+	 *
+	*/
+	int saveToDb();
+
+	/**
+	 * @brief save register msgs to database
+	 *
+	*/
+	int saveRegisterToDb();
 
 	/**
 	 * @brief calculate duration of the call
@@ -255,6 +272,11 @@ public:
 	*/
 	int calltime() { return first_packet_time; };
 
+	/**
+	 * @brief remove call from hash table
+	 *
+	*/
+	void hashRemove();
 
 	/**
 	 * @brief print debug information for the call to stdout
@@ -282,7 +304,8 @@ public:
 	queue<Call*> calls_deletequeue; //!< this queue is used for asynchronous storing CDR by the worker thread
 	list<Call*> calls_list; //!< 
 	list<Call*>::iterator call;
-	
+	map<string, Call*> calls_listMAP; //!< 
+	map<string, Call*>::iterator callMAPIT; //!< 
 	/**
 	 * @brief constructor
 	 *
@@ -407,5 +430,12 @@ private:
 		return key % MAXNODE;
 	}
 };
+
+string sqlDateTimeString(time_t unixTime);
+string sqlEscapeString(const char *inputStr, char borderChar = '\'');
+string sqlEscapeString(unsigned int inputInt, char borderChar = '\'');
+string reverseString(const char *str);
+bool isSqlDriver(const char *sqlDriver);
+bool isTypeDb(const char *typeDb);
 
 #endif

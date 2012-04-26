@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <syslog.h>
 #include <sys/resource.h>
+#include <semaphore.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -36,6 +37,11 @@
 #include "simpleini/SimpleIni.h"
 #include "manager.h"
 #include "filter_mysql.h"
+
+extern "C" {
+#include "liblfds.6/inc/liblfds.h"
+}
+
 
 using namespace std;
 
@@ -58,26 +64,45 @@ int opt_gzipGRAPH = 0;		// compress GRAPH data ?
 int opt_rtcp = 1;		// pair RTP+1 port to RTCP and save it. 
 int opt_nocdr = 0;		// do not save cdr?
 int opt_gzipPCAP = 0;		// compress PCAP data ? 
+int opt_mos_g729 = 0;		// calculate MOS for G729 codec
 int verbosity = 0;		// cebug level
-int opt_rtp_firstleg = 0;		// if == 1 then save RTP stream only for first INVITE leg in case you are 
+int opt_rtp_firstleg = 0;	// if == 1 then save RTP stream only for first INVITE leg in case you are 
 				// sniffing on SIP proxy where voipmonitor see both SIP leg. 
+int opt_jitterbuffer_f1 = 1;		// turns off/on jitterbuffer simulator to compute MOS score mos_f1
+int opt_jitterbuffer_f2 = 1;		// turns off/on jitterbuffer simulator to compute MOS score mos_f2
+int opt_jitterbuffer_adapt = 1;		// turns off/on jitterbuffer simulator to compute MOS score mos_adapt
 int opt_sip_register = 0;	// if == 1 save REGISTER messages
 int opt_ringbuffer = 10;	// ring buffer in MB 
 int opt_audio_format = FORMAT_WAV;	// define format for audio writing (if -W option)
 int opt_manager_port = 5029;	// manager api TCP port
+int opt_pcap_threaded = 0;	// run reading packets from pcap in one thread and process packets in another thread via queue
 
 char configfile[1024] = "";	// config file name
+
+char sql_driver[256] = "mysql";
+char sql_cdr_table[256] = "cdr";
+
 char mysql_host[256] = "localhost";
 char mysql_database[256] = "voipmonitor";
 char mysql_table[256] = "cdr";
 char mysql_user[256] = "root";
 char mysql_password[256] = "";
+
+char odbc_dsn[256] = "voipmonitor";
+char odbc_user[256];
+char odbc_password[256];
+char odbc_driver[256];
+
 char opt_pidfile[] = "/var/run/voipmonitor.pid";
 char user_filter[2048] = "";
 char ifname[1024];	// Specifies the name of the network device to use for 
 			// the network lookup, for example, eth0
 int opt_promisc = 1;	// put interface to promisc mode?
 char pcapcommand[4092] = "";
+
+int rtp_threaded = 0; // do not enable this until it will be reworked to be thread safe
+int num_threads = 1; // this has to be 1 for now
+
 
 char opt_chdir[1024];
 
@@ -95,6 +120,18 @@ int terminating;		// if set to 1, worker thread will terminate
 char *sipportmatrix;		// matrix of sip ports to monitor
 
 pcap_t *handle = NULL;		// pcap handler 
+
+read_thread *threads;
+
+pthread_t pcap_read_thread;
+#ifdef QUEUE_MUTEX
+pthread_mutex_t readpacket_thread_queue_lock;
+sem_t readpacket_thread_semaphore;
+#endif
+
+#ifdef QUEUE_NONBLOCK
+struct queue_state *qs_readpacket_thread_queue = NULL;
+#endif
 
 void terminate2() {
 	terminating = 1;
@@ -140,9 +177,9 @@ void *storing_cdr( void *dummy ) {
 			if(!opt_nocdr) {
 				if(verbosity > 0) printf("storing to MySQL. Queue[%d]\n", (int)calltable->calls_queue.size());
 				if(call->type == INVITE) {
-					call->saveToMysql();
+					call->saveToDb();
 				} else if(call->type == REGISTER){
-					call->saveRegisterToMysql();
+					call->saveRegisterToDb();
 				}
 			}
 
@@ -291,11 +328,18 @@ int load_config(char *fname) {
 	if((value = ini.GetValue("general", "ringbuffer", NULL))) {
 		opt_ringbuffer = atoi(value);
 	}
+	if((value = ini.GetValue("general", "pcap-thread", NULL))) {
+		opt_pcap_threaded = yesno(value);
+	}
 	if((value = ini.GetValue("general", "rtp-firstleg", NULL))) {
 		opt_rtp_firstleg = yesno(value);
 	}
 	if((value = ini.GetValue("general", "sip-register", NULL))) {
 		opt_sip_register = yesno(value);
+	}
+	if((value = ini.GetValue("general", "mos_g729", NULL))) {
+		opt_mos_g729 = yesno(value);
+		printf(":::%d\n", opt_mos_g729);
 	}
 	if((value = ini.GetValue("general", "nocdr", NULL))) {
 		opt_nocdr = yesno(value);
@@ -349,6 +393,12 @@ int load_config(char *fname) {
 	if((value = ini.GetValue("general", "promisc", NULL))) {
 		opt_promisc = yesno(value);
 	}
+	if((value = ini.GetValue("general", "sqldriver", NULL))) {
+		strncpy(sql_driver, value, sizeof(sql_driver));
+	}
+	if((value = ini.GetValue("general", "sqlcdrtable", NULL))) {
+		strncpy(sql_cdr_table, value, sizeof(sql_cdr_table));
+	}
 	if((value = ini.GetValue("general", "mysqlhost", NULL))) {
 		strncpy(mysql_host, value, sizeof(mysql_host));
 	}
@@ -368,6 +418,54 @@ int load_config(char *fname) {
 	}
 	if((value = ini.GetValue("general", "mysqlpassword", NULL))) {
 		strncpy(mysql_password, value, sizeof(mysql_password));
+	}
+	if((value = ini.GetValue("general", "odbcdsn", NULL))) {
+		strncpy(odbc_dsn, value, sizeof(odbc_dsn));
+	}
+	if((value = ini.GetValue("general", "odbcuser", NULL))) {
+		strncpy(odbc_user, value, sizeof(odbc_user));
+	}
+	if((value = ini.GetValue("general", "odbcpass", NULL))) {
+		strncpy(odbc_password, value, sizeof(odbc_password));
+	}
+	if((value = ini.GetValue("general", "odbcdriver", NULL))) {
+		strncpy(odbc_driver, value, sizeof(odbc_driver));
+	}
+	if((value = ini.GetValue("general", "jitterbuffer_f1", NULL))) {
+		switch(value[0]) {
+		case 'Y':
+		case 'y':
+		case '1':
+			opt_jitterbuffer_f1 = 1;
+			break;
+		default: 
+			opt_jitterbuffer_f1 = 0;
+			break;
+		}
+	}
+	if((value = ini.GetValue("general", "jitterbuffer_f2", NULL))) {
+		switch(value[0]) {
+		case 'Y':
+		case 'y':
+		case '1':
+			opt_jitterbuffer_f2 = 1;
+			break;
+		default: 
+			opt_jitterbuffer_f2 = 0;
+			break;
+		}
+	}
+	if((value = ini.GetValue("general", "jitterbuffer_adapt", NULL))) {
+		switch(value[0]) {
+		case 'Y':
+		case 'y':
+		case '1':
+			opt_jitterbuffer_adapt = 1;
+			break;
+		default: 
+			opt_jitterbuffer_adapt = 0;
+			break;
+		}
 	}
 	return 0;
 }
@@ -389,6 +487,9 @@ void reload_config() {
 	telnumfilter_reload->load();
 	telnumfilter_reload_do = 1;
 }
+
+int opt_test = 0;
+void test();
 
 int main(int argc, char *argv[]) {
 
@@ -424,6 +525,7 @@ int main(int argc, char *argv[]) {
 	    {"config-file", 1, 0, '7'},
 	    {"manager-port", 1, 0, '8'},
 	    {"pcap-command", 1, 0, 'a'},
+	    {"pcap-thread", 0, 0, 'T'},
 	    {0, 0, 0, 0}
 	};
 
@@ -431,12 +533,12 @@ int main(int argc, char *argv[]) {
 
 	umask(0000);
 
-	openlog("voipmonitor", LOG_CONS | LOG_PERROR, LOG_DAEMON);
+	openlog("voipmonitor", LOG_CONS | LOG_PERROR | LOG_PID, LOG_DAEMON);
 
 	/* command line arguments overrides configuration in voipmonitor.conf file */
 	while(1) {
 		int c;
-		c = getopt_long(argc, argv, "f:i:r:d:v:h:b:t:u:p:P:kncUSRAWG", long_options, &option_index);
+		c = getopt_long(argc, argv, "f:i:r:d:v:h:b:t:u:p:P:kncUSRAWGXT", long_options, &option_index);
 		//"i:r:d:v:h:b:u:p:fnU", NULL, NULL);
 		if (c == -1)
 			break;
@@ -449,6 +551,9 @@ int main(int argc, char *argv[]) {
 			*/
 			case 'a':
 				strncpy(pcapcommand, optarg, sizeof(pcapcommand));
+				break;
+			case 'T':
+				opt_pcap_threaded = 1;
 				break;
 			case '1':
 				opt_gzipGRAPH = 1;
@@ -546,6 +651,9 @@ int main(int argc, char *argv[]) {
 					opt_gzipGRAPH = 1;
 				}
 				break;
+			case 'X':
+				opt_test = 1;
+				break;
 		}
 	}
 	if ((fname == NULL) && (ifname[0] == '\0')){
@@ -586,9 +694,14 @@ int main(int argc, char *argv[]) {
 				"      save REGISTER messages\n"
 				"\n"
 				" --ring-buffer\n"
-				"      Set ring buffer in MB (feature of newer >= 2.6.31 kernels). If you see voipmonitor dropping packets in syslog\n"
-				"      upgrade to newer kernel and increase --ring-buffer to higher MB. It is buffer between pcap library and voipmonitor.\n"
-				"      The most reason why voipmonitor drops packets is waiting for I/O operations (switching to ext4 from ext3 also helps.\n"
+				"      Set ring buffer in MB (feature of newer >= 2.6.31 kernels and libpcap >= 1.0.0). If you see voipmonitor dropping\n"
+				"      packets in syslog upgrade to newer kernel and increase --ring-buffer to higher MB or enable --pcap-thread.\n"
+				"      Ring-buffer is between kernel and pcap library. The most top reason why voipmonitor drops packets is waiting for I/O\n"
+				"      operations or it consumes 100%% CPU.\n"
+				"\n"
+				" --pcap-thread\n"
+				"      Read packet from kernel in one thread and process packet in another thread. Packets are copied to non-blocking queue\n"
+				"      use this option if voipmonitor is dropping packets (you can see it in syslog). You can Use this option with --ring-buffer\n"
 				"\n"
 				" -c, --no-cdr\n"
 				"      do no save CDR to MySQL database.\n"
@@ -653,6 +766,10 @@ int main(int argc, char *argv[]) {
 	
 	bpf_u_int32 mask;		// Holds the subnet mask associated with device.
 	char errbuf[PCAP_ERRBUF_SIZE];	// Returns error text and is only set when the pcap_lookupnet subroutine fails.
+	
+	if(opt_test) {
+		test();
+	}
 
 	if (fname == NULL && ifname[0] != '\0'){
 		bpf_u_int32 net;
@@ -702,10 +819,13 @@ int main(int argc, char *argv[]) {
 		}
 
 		if((status = pcap_activate(handle)) != 0) {
-			fprintf(stderr, "error pcap_activate\n");
+			fprintf(stderr, "libpcap error: [%s]\n", pcap_geterr(handle));
 			return(2);
 		}
 	} else {
+		// if reading file
+		rtp_threaded = 0;
+		opt_pcap_threaded = 0; //disable threading because it is useless while reading packets from file
 		printf("Reading file: %s\n", fname);
 		mask = PCAP_NETMASK_UNKNOWN;
 		handle = pcap_open_offline(fname, errbuf);
@@ -765,6 +885,36 @@ int main(int argc, char *argv[]) {
 
 	// start manager thread 	
 	pthread_create(&manager_thread, NULL, manager_server, NULL);
+
+	// start reading threads
+	if(rtp_threaded) {
+		threads = new read_thread();
+		for(int i = 0; i < num_threads; i++) {
+#ifdef QUEUE_MUTEX
+			pthread_mutex_init(&(threads[i].qlock), NULL);
+			sem_init(&(threads[i].semaphore), 0, 0);
+#endif
+
+#ifdef QUEUE_NONBLOCK
+			threads[i].pqueue = NULL;
+			queue_new(&(threads[i].pqueue), 10000);
+#endif
+
+			pthread_create(&(threads[i].thread), NULL, rtp_read_thread_func, (void*)&threads[i]);
+		}
+	}
+	if(opt_pcap_threaded) {
+#ifdef QUEUE_MUTEX
+		pthread_mutex_init(&readpacket_thread_queue_lock, NULL);
+		sem_init(&readpacket_thread_semaphore, 0, 0);
+#endif
+
+#ifdef QUEUE_NONBLOCK
+		queue_new(&qs_readpacket_thread_queue, 100000);
+		pthread_create(&pcap_read_thread, NULL, pcap_read_thread_func, NULL);
+#endif
+	}
+
 	// start reading packets
 //	readdump_libnids(handle);
 	readdump_libpcap(handle);
@@ -793,4 +943,19 @@ int main(int argc, char *argv[]) {
 	delete calltable;
 	free(sipportmatrix);
 	unlink(opt_pidfile);
+}
+
+extern string sqlString(const char *inputStr, char borderChar = '\'');
+	
+void test() {
+
+	ipfilter = new IPfilter;
+	ipfilter->load();
+	ipfilter->dump();
+
+	telnumfilter = new TELNUMfilter;
+	telnumfilter->load();
+	telnumfilter->dump();
+	
+	exit(0);
 }
